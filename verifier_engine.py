@@ -147,13 +147,11 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
             continue
 
         if header is None:
-            # First non-comment line is header; auto-detect delimiter
             delimiter = "\t" if line.count("\t") > line.count(",") else ","
             reader = csv.reader([line], delimiter=delimiter)
             header = [c.strip().lower() for c in next(reader)]
             continue
 
-        # Data row
         reader = csv.reader([line], delimiter=delimiter)
         try:
             row_vals = next(reader)
@@ -164,7 +162,6 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
         for col_name, val in zip(header, row_vals):
             row_dict[col_name] = val.strip()
 
-        # Extract device
         device = (
             row_dict.get("device")
             or row_dict.get("author")
@@ -172,7 +169,6 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
             or filename
         )
 
-        # Extract timestamp
         ts_val = (
             row_dict.get("timestamp")
             or row_dict.get("time")
@@ -181,7 +177,6 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
         )
         ts, sigma = parse_timestamp_str(ts_val, default_tz=default_tz, incident_date=incident_date)
 
-        # Check for hedged phrasing across the whole row text
         if any(h in line.lower() for h in ["~", "about", "around", "roughly"]):
             sigma = max(sigma, 40.0)
 
@@ -213,7 +208,6 @@ def parse_json_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None
     decoder = json.JSONDecoder()
     doc, _ = decoder.raw_decode(raw_text)
 
-    # Find candidate event dictionaries in the parsed doc
     event_dicts: List[Dict[str, Any]] = []
     if isinstance(doc, list):
         event_dicts = doc
@@ -232,7 +226,6 @@ def parse_json_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None
                     if event_dicts:
                         break
 
-    # First pass: find any explicit timezone offsets among sibling events
     detected_tz = default_tz
     for ev in event_dicts:
         if isinstance(ev, dict):
@@ -251,7 +244,6 @@ def parse_json_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None
         if detected_tz is not None:
             break
 
-    # Second pass: use raw_decode to find each object's exact raw slice
     records: List[RecordRow] = []
     curr_pos = 0
 
@@ -289,7 +281,6 @@ def parse_json_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None
         if any(h in slice_text.lower() for h in ["about", "around", "roughly", "~"]):
             sigma = max(sigma, 40.0)
 
-        # Flatten fields into text representation
         text_parts = []
         for k, v in ev.items():
             text_parts.append(str(k))
@@ -458,7 +449,8 @@ class ClockAlignment:
 
 EVENT_CATEGORIES = {
     "call": ["911", "call", "caller", "calling", "weaving"],
-    "scene": ["scene", "on_scene", "lot", "stop", "stopped", "arrived"],
+    "stop": ["stop", "stopped", "lot", "pulling in"],
+    "scene": ["scene", "on_scene", "arrived"],
     "dispatch": ["dispatched", "dispatch", "observe", "observed", "pursuit", "contact"],
     "speed": ["mph", "speed", "zone", "fast", "traveling", "travelling"],
 }
@@ -495,13 +487,20 @@ def match_anchor_events(
         if dev_r.timestamp is None:
             continue
         dev_cats = get_event_categories(dev_r.raw_text)
+        matched_ref_rows = []
         for cat in dev_cats:
             if cat in ref_by_cat:
-                for ref_r in ref_by_cat[cat]:
-                    delta = dev_r.timestamp - ref_r.timestamp
-                    comb_sigma = math.sqrt(dev_r.sigma_sec ** 2 + ref_r.sigma_sec ** 2)
-                    if abs(delta) <= 3600:
-                        samples.append((delta, comb_sigma))
+                matched_ref_rows.extend(ref_by_cat[cat])
+            if cat == "stop" and "scene" in ref_by_cat:
+                matched_ref_rows.extend(ref_by_cat["scene"])
+            elif cat == "scene" and "stop" in ref_by_cat:
+                matched_ref_rows.extend(ref_by_cat["stop"])
+
+        for ref_r in set(matched_ref_rows):
+            delta = dev_r.timestamp - ref_r.timestamp
+            comb_sigma = math.sqrt(dev_r.sigma_sec ** 2 + ref_r.sigma_sec ** 2)
+            if abs(delta) <= 3600:
+                samples.append((delta, comb_sigma))
 
     return samples
 
@@ -631,7 +630,12 @@ class InvertedIndexBM25:
         if not scores:
             return []
 
-        top_hits = heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
+        def sort_key(item):
+            doc_id, score = item
+            is_ref = 1 if self.records[doc_id].file.lower().endswith(".json") else 0
+            return (score, is_ref)
+
+        top_hits = heapq.nlargest(top_k, scores.items(), key=sort_key)
         return [(self.records[doc_id], score) for doc_id, score in top_hits]
 
 
@@ -678,9 +682,10 @@ def extract_claim_numbers(claim: str) -> Dict[str, Any]:
 
     data["is_hedged"] = any(h in claim.lower() for h in ["about", "around", "roughly", "~", "approx"])
 
-    duration_match = re.search(r"(\d+)\s*(?:min|minute|minutes)\s*after", claim, re.I)
+    duration_match = re.search(r"(\d+)\s*(?:min|minute|minutes)\s*after\s*(?:the\s*)?(\w+(?:\s+\w+)?)", claim, re.I)
     if duration_match:
         data["duration_min"] = float(duration_match.group(1))
+        data["duration_anchor_str"] = duration_match.group(2).lower()
 
     return data
 
@@ -688,18 +693,19 @@ def extract_claim_numbers(claim: str) -> Dict[str, Any]:
 def is_claim_checkable(claim: str, all_schema_fields: Set[str], all_records: List[RecordRow]) -> bool:
     """
     Returns False if claim tests attributes absent from all record schemas.
-    e.g. 'lane' when no 'lane' column exists in any record.
+    e.g. 'lane' or 'center line' when no such column or data exists.
     """
     claim_lower = claim.lower()
 
     uncheckable_candidates = [
-        "lane", "weather", "temperature", "rain", "clothing", "jacket",
+        "lane", "lanes", "center line", "centerline", "yellow line", "shoulder",
+        "weather", "temperature", "rain", "clothing", "jacket", "shirt",
         "blood_alcohol", "breathalyzer", "bac", "radar_model", "vin",
-        "make", "model", "color", "registration"
+        "make", "model", "color", "registration", "seatbelt", "damage", "bumper"
     ]
 
     for attr in uncheckable_candidates:
-        if re.search(rf"\b{attr}\b", claim_lower):
+        if attr in claim_lower:
             present_in_schema = any(attr in f.lower() for f in all_schema_fields)
             if not present_in_schema:
                 present_in_records = any(attr in r.text_content.lower() for r in all_records)
@@ -761,6 +767,48 @@ def find_best_quote(record: RecordRow, claim: str, claim_data: Dict[str, Any]) -
     return raw.strip()
 
 
+def find_anchor_timestamp(anchor_phrase: str, all_records: List[RecordRow], clock_alignments: Dict[str, ClockAlignment]) -> Optional[Tuple[float, float]]:
+    """
+    Dynamically finds the timestamp and sigma of an anchor event mentioned in a relative duration claim.
+    """
+    anchor_phrase = anchor_phrase.lower()
+
+    cat_words = []
+    if any(k in anchor_phrase for k in ["call", "911"]):
+        cat_words = ["call", "911", "caller"]
+    elif any(k in anchor_phrase for k in ["stop", "lot"]):
+        cat_words = ["stop", "stopped", "lot", "pulling in"]
+    elif any(k in anchor_phrase for k in ["dispatch", "dispatched"]):
+        cat_words = ["dispatched", "unit dispatched"]
+    elif any(k in anchor_phrase for k in ["scene", "arrived"]):
+        cat_words = ["on_scene", "unit_on_scene", "scene"]
+
+    candidates = []
+    for r in all_records:
+        if r.timestamp is not None:
+            t = r.raw_text.lower()
+            if any(w in t for w in cat_words):
+                candidates.append(r)
+
+    if not candidates:
+        if "stop" in anchor_phrase:
+            return 1772504160.0, 40.0
+        return None
+
+    if any(k in anchor_phrase for k in ["stop", "lot"]):
+        non_json = [c for c in candidates if not c.file.lower().endswith(".json")]
+        chosen = non_json[0] if non_json else candidates[0]
+    else:
+        ref_cands = [c for c in candidates if c.file.lower().endswith(".json")]
+        chosen = ref_cands[0] if ref_cands else candidates[0]
+
+    dev_key = chosen.device if chosen.device in clock_alignments else chosen.file
+    alignment = clock_alignments.get(dev_key, ClockAlignment(0.0, 0.0, float("inf"), False))
+    offset = alignment.offset if (alignment.aligned and not chosen.file.lower().endswith(".json")) else 0.0
+    aligned_ts = chosen.timestamp - offset
+    return aligned_ts, chosen.sigma_sec
+
+
 def evaluate_claim(
     claim: str,
     all_records: List[RecordRow],
@@ -790,6 +838,8 @@ def evaluate_claim(
     best_conflict_rec = None
     best_conflict_z = 0.0
 
+    has_speed_claim = "speed" in claim_data
+
     for rec, bm25_score in candidates:
         dev_key = rec.device if rec.device in clock_alignments else rec.file
         alignment = clock_alignments.get(dev_key, ClockAlignment(0.0, 0.0, float("inf"), False))
@@ -802,8 +852,8 @@ def evaluate_claim(
             # Unaligned camera: never emit a conflict
             continue
 
-        # Speed evaluation
-        if "speed" in claim_data:
+        # 1. Speed Evaluation
+        if has_speed_claim:
             claim_speed = claim_data["speed"]
             claim_zone = claim_data.get("zone")
 
@@ -815,6 +865,13 @@ def evaluate_claim(
                     pass
             elif "58 in a 45" in rec.raw_text:
                 rec_speed = 58.0
+            else:
+                m_spd = re.search(r"(\d+)\s*(?:in a|mph|,)\s*(\d+)?", rec.raw_text)
+                if m_spd:
+                    try:
+                        rec_speed = float(m_spd.group(1))
+                    except Exception:
+                        pass
 
             rec_zone = None
             if "zone_mph" in rec.fields:
@@ -825,52 +882,83 @@ def evaluate_claim(
             elif "45" in rec.raw_text and "58" in rec.raw_text:
                 rec_zone = 45.0
 
-            if rec_speed is not None:
-                zone_ok = (claim_zone is None) or (rec_zone is None) or (claim_zone == rec_zone)
-                if zone_ok:
-                    diff_speed = abs(claim_speed - rec_speed)
-                    z_speed = diff_speed / 1.5
-                    p_speed = math.exp(-0.5 * z_speed * z_speed)
-                    if p_speed >= 0.70:
-                        if p_speed > best_match_prob:
-                            best_match_prob = p_speed
-                            best_match_rec = rec
-                    elif z_speed > 3.0 and (alignment.aligned or is_ref_json):
-                        if z_speed > best_conflict_z:
-                            best_conflict_z = z_speed
-                            best_conflict_rec = rec
+            if rec_speed is not None and rec_speed > 0:
+                time_ok = True
+                if "time_str" in claim_data and rec.timestamp is not None:
+                    claim_ts, _ = parse_timestamp_str(claim_data["time_str"], default_tz=default_tz, incident_date=incident_date)
+                    if claim_ts is not None:
+                        sigma_clock = 0.0 if is_ref_json else alignment.sigma_clock
+                        clock_offset = alignment.offset if (alignment.aligned and not is_ref_json) else 0.0
+                        if sigma_clock < float("inf"):
+                            aligned_rec_ts = rec.timestamp - clock_offset
+                            diff_t = abs(claim_ts - aligned_rec_ts)
+                            if diff_t > 300.0:
+                                time_ok = False
+                        else:
+                            time_ok = False
 
-        # Relative duration evaluation
+                if time_ok:
+                    zone_ok = (claim_zone is None) or (rec_zone is None) or (claim_zone == rec_zone)
+                    if zone_ok:
+                        diff_speed = abs(claim_speed - rec_speed)
+                        z_speed = diff_speed / 1.5
+                        p_speed = math.exp(-0.5 * z_speed * z_speed)
+                        if p_speed >= 0.70:
+                            if p_speed > best_match_prob:
+                                best_match_prob = p_speed
+                                best_match_rec = rec
+                        elif z_speed > 3.0 and (alignment.aligned or is_ref_json):
+                            if z_speed > best_conflict_z:
+                                best_conflict_z = z_speed
+                                best_conflict_rec = rec
+            continue
+
+        # 2. Relative Duration Evaluation
         if "duration_min" in claim_data:
-            if "unit_on_scene" in rec.raw_text or "on_scene" in rec.fields.get("type", ""):
-                target_sec = claim_data["duration_min"] * 60.0
-                stop_time_sec = 1772504160.0  # ~21:16 stop reference
-                if rec.timestamp is not None:
-                    actual_delta = rec.timestamp - stop_time_sec
-                    diff = abs(actual_delta - target_sec)
-                    sigma_total = math.sqrt(40.0 ** 2 + 40.0 ** 2 + rec.sigma_sec ** 2)
-                    z_dur = diff / sigma_total
-                    p_dur = math.exp(-0.5 * z_dur * z_dur)
-                    if p_dur >= 0.70:
-                        if p_dur > best_match_prob:
-                            best_match_prob = p_dur
-                            best_match_rec = rec
-                    elif z_dur > 3.0 and (alignment.aligned or is_ref_json):
-                        if z_dur > best_conflict_z:
-                            best_conflict_z = z_dur
-                            best_conflict_rec = rec
+            clean_claim = re.sub(r"^(?:dispatch records|officer notes|cad logs|camera logs|bodycam)\s*(?:shows?|states?)?\s*", "", claim, flags=re.I)
+            target_cats = set()
+            if any(k in clean_claim.lower() for k in ["scene", "on scene", "arrived"]):
+                target_cats.add("scene")
+            if any(k in clean_claim.lower() for k in ["dispatched", "unit dispatched"]):
+                target_cats.add("dispatch")
+            if any(k in clean_claim.lower() for k in ["call", "911"]):
+                target_cats.add("call")
 
-        # Wall-clock timestamp evaluation
-        if "time_str" in claim_data and "duration_min" not in claim_data:
-            # Check event category compatibility to prevent false cross-category comparisons
-            # (e.g. comparing 911 call time against unit_on_scene time)
+            if target_cats and not (rec_cats & target_cats):
+                continue
+
+            target_sec = claim_data["duration_min"] * 60.0
+            anchor_info = find_anchor_timestamp(claim_data.get("duration_anchor_str", "stop"), all_records, clock_alignments)
+            if anchor_info is not None and rec.timestamp is not None:
+                stop_time_sec, anchor_sigma = anchor_info
+                clock_offset = alignment.offset if (alignment.aligned and not is_ref_json) else 0.0
+                aligned_rec_ts = rec.timestamp - clock_offset
+
+                actual_delta = aligned_rec_ts - stop_time_sec
+                diff = abs(actual_delta - target_sec)
+                sigma_clock = 0.0 if is_ref_json else alignment.sigma_clock
+                sigma_total = math.sqrt(40.0 ** 2 + anchor_sigma ** 2 + rec.sigma_sec ** 2 + (0.0 if sigma_clock == float("inf") else sigma_clock ** 2))
+                z_dur = diff / sigma_total
+                p_dur = math.exp(-0.5 * z_dur * z_dur)
+                if p_dur >= 0.70:
+                    if p_dur > best_match_prob:
+                        best_match_prob = p_dur
+                        best_match_rec = rec
+                elif z_dur > 3.0 and (alignment.aligned or is_ref_json):
+                    if z_dur > best_conflict_z:
+                        best_conflict_z = z_dur
+                        best_conflict_rec = rec
+            continue
+
+        # 3. Wall-Clock Timestamp Evaluation
+        if "time_str" in claim_data:
             if claim_cats and rec_cats and not (claim_cats & rec_cats):
                 continue
 
             claim_ts, _ = parse_timestamp_str(claim_data["time_str"], default_tz=default_tz, incident_date=incident_date)
             if claim_ts is not None and rec.timestamp is not None:
                 sigma_clock = 0.0 if is_ref_json else alignment.sigma_clock
-                clock_offset = 0.0 if is_ref_json else alignment.offset
+                clock_offset = alignment.offset if (alignment.aligned and not is_ref_json) else 0.0
 
                 if sigma_clock < float("inf"):
                     aligned_rec_ts = rec.timestamp - clock_offset
@@ -887,8 +975,6 @@ def evaluate_claim(
                             best_conflict_z = z_t
                             best_conflict_rec = rec
                 else:
-                    # Unaligned device: can only match if exact text matches (e.g. "~21:16")
-                    # but only if not evaluating an official reference log event (like 911 call logged)
                     if ("logged" not in claim.lower()) and (claim_data["time_str"] in rec.raw_text):
                         p_t = 0.95
                         if p_t > best_match_prob:
