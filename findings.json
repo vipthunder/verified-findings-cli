@@ -1,0 +1,39 @@
+{
+  "findings": [
+    {
+      "claim": "Officer Lee first observed the blue sedan at about 21:14 near mile marker 4, travelling 58 mph in a posted 45 zone.",
+      "finding": "match",
+      "cite": {
+        "file": "bodycam_transcript.vtt",
+        "row": 1
+      },
+      "quote": "[SYNTHETIC] Officer Lee: 58 in a 45."
+    },
+    {
+      "claim": "The driver pulled into the Harbor Gas lot and stopped around 21:16.",
+      "finding": "match",
+      "cite": {
+        "file": "bodycam_transcript.vtt",
+        "row": 3
+      },
+      "quote": "[SYNTHETIC] Officer Lee: Pulling in at the lot, about 21:16."
+    },
+    {
+      "claim": "A 911 call reporting the incident was logged at 21:11.",
+      "finding": "not_settled"
+    },
+    {
+      "claim": "Dispatch records show a unit on scene roughly 2 minutes after the stop.",
+      "finding": "match",
+      "cite": {
+        "file": "dispatch.json",
+        "row": 2
+      },
+      "quote": "\"type\": \"unit_on_scene\""
+    },
+    {
+      "claim": "Officer Lee states the vehicle was the only car in the lane.",
+      "finding": "not_checkable"
+    }
+  ]
+}
