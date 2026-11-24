@@ -80,6 +80,13 @@ def parse_timestamp_str(
     if not s:
         return None, 30.0
 
+    # Fast path for numeric epoch strings (e.g. 1772504100 or 1772504100000)
+    if s.isdigit():
+        num = float(s)
+        if num > 3e10:
+            num /= 1000.0
+        return num, 1.0
+
     # Check hedged phrasing in the timestamp string
     is_hedged = any(h in s.lower() for h in ["about", "around", "roughly", "~", "approx"])
     clean_s = re.sub(r"^(about|around|roughly|approx|\~)\s*", "", s, flags=re.IGNORECASE).strip()
@@ -152,11 +159,13 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
             header = [c.strip().lower() for c in next(reader)]
             continue
 
-        reader = csv.reader([line], delimiter=delimiter)
-        try:
-            row_vals = next(reader)
-        except Exception:
-            continue
+        if '"' not in line:
+            row_vals = line.split(delimiter)
+        else:
+            try:
+                row_vals = next(csv.reader([line], delimiter=delimiter))
+            except Exception:
+                continue
 
         row_dict = {}
         for col_name, val in zip(header, row_vals):
@@ -177,7 +186,7 @@ def parse_csv_file(file_path: str, default_tz: Optional[datetime.tzinfo] = None,
         )
         ts, sigma = parse_timestamp_str(ts_val, default_tz=default_tz, incident_date=incident_date)
 
-        if any(h in line.lower() for h in ["~", "about", "around", "roughly"]):
+        if "~" in line or any(h in line.lower() for h in ["about", "around", "roughly"]):
             sigma = max(sigma, 40.0)
 
         rec = RecordRow(
@@ -413,6 +422,14 @@ def ingest_records(records_dir: str) -> Tuple[List[RecordRow], Set[str], Optiona
     if default_tz is None:
         default_tz = datetime.timezone(datetime.timedelta(hours=-5))
     if incident_date is None:
+        for r in all_rows:
+            if r.timestamp is not None:
+                try:
+                    incident_date = datetime.datetime.fromtimestamp(r.timestamp, tz=default_tz).date()
+                    break
+                except Exception:
+                    pass
+    if incident_date is None:
         incident_date = datetime.date(2026, 3, 2)
 
     # Pass 2: Parse CSV and VTT files
@@ -458,7 +475,8 @@ EVENT_CATEGORIES = {
 
 def get_event_categories(text: str) -> Set[str]:
     """Extracts semantic event categories from text."""
-    t = re.sub(r"[^a-zA-Z0-9]+", " ", text.lower())
+    cleaned = re.sub(r"\bcall[_\s]?(?:id|num|number)\b", "", text.lower())
+    t = re.sub(r"[^a-zA-Z0-9]+", " ", cleaned)
     cats = set()
     for cat, kws in EVENT_CATEGORIES.items():
         if any(re.search(rf"\b{kw}\b", t) for kw in kws):
@@ -536,7 +554,7 @@ def run_gaussian_kde(samples: List[Tuple[float, float]]) -> ClockAlignment:
 
     in_band_w = sum(1.0 / s for delta, s in samples if abs(delta - theta_map) <= 2.5 * s)
     in_band_ratio = in_band_w / total_w
-    shrinkage = 1.0 - math.exp(-N / 1.5)
+    shrinkage = 1.0 - math.exp(-N / 1.2)
     confidence = in_band_ratio * shrinkage
 
     if confidence >= 0.75:
@@ -592,7 +610,7 @@ class InvertedIndexBM25:
 
     @classmethod
     def tokenize(cls, text: str) -> List[str]:
-        return [t.lower() for t in cls.TOKEN_RE.findall(text) if len(t) >= 1]
+        return cls.TOKEN_RE.findall(text.lower())
 
     def _build_index(self):
         for doc_id, rec in enumerate(self.records):
@@ -660,6 +678,35 @@ def split_report_into_claims(report_text: str) -> List[str]:
             if s_clean:
                 claims.append(s_clean)
     return claims
+
+
+def is_source_compatible(claim: str, rec: RecordRow) -> bool:
+    """
+    Checks if a claim that explicitly names an evidence source
+    is compatible with the record's source/file/device type.
+    """
+    c = claim.lower()
+    r_file = rec.file.lower()
+    r_dev = rec.device.lower()
+    combined = f"{r_file} {r_dev}"
+
+    if any(s in c for s in ["surveillance", "footage", "cctv"]):
+        if not any(s in combined for s in ["camera", "cam", "cctv", "video", "surveillance"]):
+            return False
+
+    if "bodycam" in c:
+        if not any(s in combined for s in ["bodycam", "transcript", "vtt"]):
+            return False
+
+    if "dispatch records" in c or "cad logs" in c or "dispatch record" in c:
+        if not any(s in combined for s in ["dispatch", "cad", ".json"]):
+            return False
+
+    if "officer notes" in c or "notes show" in c or "notes state" in c:
+        if not any(s in combined for s in ["note", "notes", ".csv"]):
+            return False
+
+    return True
 
 
 def extract_claim_numbers(claim: str) -> Dict[str, Any]:
@@ -740,7 +787,7 @@ def find_best_quote(record: RecordRow, claim: str, claim_data: Dict[str, Any]) -
             candidates.append(m_logged.group(0))
 
     # 3. CSV note cell or note value: e.g. "Stopped at lot ~21:16,21:16"
-    note_val = record.fields.get("note")
+    note_val = record.fields.get("note") or record.fields.get("notes") or record.fields.get("details") or record.fields.get("text")
     if note_val and note_val in raw:
         candidates.append(note_val)
 
@@ -791,8 +838,6 @@ def find_anchor_timestamp(anchor_phrase: str, all_records: List[RecordRow], cloc
                 candidates.append(r)
 
     if not candidates:
-        if "stop" in anchor_phrase:
-            return 1772504160.0, 40.0
         return None
 
     if any(k in anchor_phrase for k in ["stop", "lot"]):
@@ -841,6 +886,9 @@ def evaluate_claim(
     has_speed_claim = "speed" in claim_data
 
     for rec, bm25_score in candidates:
+        if not is_source_compatible(claim, rec):
+            continue
+
         dev_key = rec.device if rec.device in clock_alignments else rec.file
         alignment = clock_alignments.get(dev_key, ClockAlignment(0.0, 0.0, float("inf"), False))
         is_ref_json = rec.file.lower().endswith(".json")
@@ -848,7 +896,7 @@ def evaluate_claim(
 
         # Multi-row traffic CSV filtering
         is_camera = "camera" in rec.file.lower() or "cam" in rec.device.lower()
-        if is_camera and not alignment.aligned:
+        if is_camera and not alignment.aligned and not has_speed_claim:
             # Unaligned camera: never emit a conflict
             continue
 
@@ -858,29 +906,37 @@ def evaluate_claim(
             claim_zone = claim_data.get("zone")
 
             rec_speed = None
+            rec_zone = None
+
             if "speed_mph" in rec.fields:
                 try:
                     rec_speed = float(rec.fields["speed_mph"])
                 except Exception:
                     pass
-            elif "58 in a 45" in rec.raw_text:
-                rec_speed = 58.0
-            else:
-                m_spd = re.search(r"(\d+)\s*(?:in a|mph|,)\s*(\d+)?", rec.raw_text)
-                if m_spd:
-                    try:
-                        rec_speed = float(m_spd.group(1))
-                    except Exception:
-                        pass
-
-            rec_zone = None
             if "zone_mph" in rec.fields:
                 try:
                     rec_zone = float(rec.fields["zone_mph"])
                 except Exception:
                     pass
-            elif "45" in rec.raw_text and "58" in rec.raw_text:
-                rec_zone = 45.0
+
+            # General regex extraction for speed and zone from text when absent from fields
+            if rec_speed is None or rec_zone is None:
+                m_both = re.search(r"\b(\d+)\s+in\s+a\s+(\d+)\b", rec.raw_text, re.I)
+                if m_both:
+                    if rec_speed is None:
+                        rec_speed = float(m_both.group(1))
+                    if rec_zone is None:
+                        rec_zone = float(m_both.group(2))
+
+            if rec_speed is None:
+                m_spd = re.search(r"\b(\d+)\s*(?:mph|miles per hour)\b", rec.raw_text, re.I)
+                if m_spd:
+                    rec_speed = float(m_spd.group(1))
+
+            if rec_zone is None:
+                m_zn = re.search(r"\b(\d+)\s*(?:mph\s*)?zone\b", rec.raw_text, re.I)
+                if m_zn:
+                    rec_zone = float(m_zn.group(1))
 
             if rec_speed is not None and rec_speed > 0:
                 time_ok = True
@@ -895,7 +951,9 @@ def evaluate_claim(
                             if diff_t > 300.0:
                                 time_ok = False
                         else:
-                            time_ok = False
+                            diff_t = abs(claim_ts - rec.timestamp)
+                            if diff_t > 300.0:
+                                time_ok = False
 
                 if time_ok:
                     zone_ok = (claim_zone is None) or (rec_zone is None) or (claim_zone == rec_zone)
@@ -907,7 +965,7 @@ def evaluate_claim(
                             if p_speed > best_match_prob:
                                 best_match_prob = p_speed
                                 best_match_rec = rec
-                        elif z_speed > 3.0 and (alignment.aligned or is_ref_json):
+                        elif z_speed > 3.0 and (alignment.aligned or is_ref_json) and not is_camera:
                             if z_speed > best_conflict_z:
                                 best_conflict_z = z_speed
                                 best_conflict_rec = rec
@@ -971,14 +1029,43 @@ def evaluate_claim(
                             best_match_prob = p_t
                             best_match_rec = rec
                     elif z_t > 3.0 and (alignment.aligned or is_ref_json) and not is_camera:
-                        if z_t > best_conflict_z:
-                            best_conflict_z = z_t
-                            best_conflict_rec = rec
+                        has_cat_match = bool(claim_cats and rec_cats and (claim_cats & rec_cats))
+                        claim_w = set(re.findall(r"\b[a-zA-Z]{4,}\b", claim.lower())) - {
+                            "about", "around", "roughly", "shows", "states", "stated", "officer", "records", "record"
+                        }
+                        rec_w = set(re.findall(r"\b[a-zA-Z]{4,}\b", rec.raw_text.lower()))
+                        has_word_match = bool(claim_w and (claim_w & rec_w))
+                        if has_cat_match or has_word_match:
+                            if z_t > best_conflict_z:
+                                best_conflict_z = z_t
+                                best_conflict_rec = rec
                 else:
                     if ("logged" not in claim.lower()) and (claim_data["time_str"] in rec.raw_text):
-                        p_t = 0.95
-                        if p_t > best_match_prob:
-                            best_match_prob = p_t
+                        claim_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", claim.lower())) - {
+                            "about", "around", "roughly", "shows", "states", "stated", "officer", "records", "record"
+                        }
+                        rec_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", rec.raw_text.lower()))
+                        if claim_words and (claim_words & rec_words):
+                            p_t = 0.95
+                            if p_t > best_match_prob:
+                                best_match_prob = p_t
+                                best_match_rec = rec
+
+        # 4. Textual / Semantic Verification (for claims without numeric speed, duration, or timestamp)
+        if not has_speed_claim and "duration_min" not in claim_data and "time_str" not in claim_data:
+            neg_re = re.compile(r"\b(?:not|no|never|neither|nor|none|didn't|wasn't|weren't|isn't|aren't|cannot|can't)\b", re.I)
+            if bool(neg_re.search(claim)) == bool(neg_re.search(rec.raw_text)):
+                claim_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", claim.lower())) - {
+                    "officer", "states", "stated", "notes", "noted", "records", "record", "shows", "shown", "claims", "claimed"
+                }
+                if claim_words:
+                    rec_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", rec.raw_text.lower()))
+                    overlap = claim_words & rec_words
+                    ratio = len(overlap) / len(claim_words)
+                    if ratio >= 0.70:
+                        p_text = 0.95
+                        if p_text > best_match_prob:
+                            best_match_prob = p_text
                             best_match_rec = rec
 
     finding = "not_settled"

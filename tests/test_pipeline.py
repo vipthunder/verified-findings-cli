@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import tempfile
 import unittest
 import subprocess
@@ -259,7 +260,15 @@ class TestPipeline(unittest.TestCase):
 
     def test_07_kde_multi_anchor_alignment_vs_refusal(self):
         """Tests Gaussian KDE multi-anchor alignment vs unreliable clock refusal."""
-        # 1. Multi-anchor concordant: 3 anchors near +45s offset
+        # 1. Two-anchor concordant: N=2 anchors near +45s offset reaches confidence = 0.811 >= 0.75
+        samples_two = [(45.0, 2.0), (45.5, 2.0)]
+        align_two = run_gaussian_kde(samples_two)
+        self.assertTrue(align_two.aligned)
+        self.assertGreaterEqual(align_two.confidence, 0.75)
+        self.assertAlmostEqual(align_two.offset, 45.0, delta=5.0)
+        self.assertLess(align_two.sigma_clock, 5.0)
+
+        # 3 anchors also align with higher confidence
         samples_good = [(45.0, 2.0), (44.0, 2.0), (46.0, 2.0)]
         align_good = run_gaussian_kde(samples_good)
         self.assertTrue(align_good.aligned)
@@ -267,7 +276,7 @@ class TestPipeline(unittest.TestCase):
         self.assertAlmostEqual(align_good.offset, 45.0, delta=5.0)
         self.assertLess(align_good.sigma_clock, 5.0)
 
-        # 2. Single anchor: shrinkage factor (1 - exp(-1 / 1.5)) is ~0.487 < 0.75
+        # 2. Single anchor: shrinkage factor (1 - exp(-1 / 1.2)) is ~0.565 < 0.75
         samples_single = [(45.0, 2.0)]
         align_single = run_gaussian_kde(samples_single)
         self.assertFalse(align_single.aligned)
@@ -356,6 +365,129 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(res["finding"], "match")
         self.assertIn("quote", res)
         self.assertIn(res["quote"], row.raw_text)
+
+    def test_11_unaligned_camera_speed_match_vs_conflict_refusal(self):
+        """Tests that an unaligned camera confirms an exact speed+zone match but refuses to emit conflict."""
+        # 1. Unaligned camera matches exact speed and zone
+        cam_row_match = RecordRow(
+            file="camera_log.csv",
+            row=10,
+            raw_text="2026-03-02T21:14:30-05:00,CAM-07,58,45",
+            device="CAM-07",
+            timestamp=1772504070.0,
+            sigma_sec=2.0,
+            fields={"timestamp": "2026-03-02T21:14:30-05:00", "device": "CAM-07", "speed_mph": "58", "zone_mph": "45"},
+            text_content="2026-03-02T21:14:30-05:00,CAM-07,58,45",
+        )
+        claim_match = "Vehicle observed travelling 58 mph in a posted 45 zone near 21:14."
+        retriever_match = InvertedIndexBM25([cam_row_match])
+        schema_fields = {"speed_mph", "zone_mph", "device"}
+        unaligned_clock = {"CAM-07": ClockAlignment(0.0, 0.0, float("inf"), False)}
+
+        tz_neg5 = datetime.timezone(datetime.timedelta(hours=-5))
+        res_match = evaluate_claim(
+            claim=claim_match,
+            all_records=[cam_row_match],
+            all_schema_fields=schema_fields,
+            retriever=retriever_match,
+            clock_alignments=unaligned_clock,
+            default_tz=tz_neg5,
+            incident_date=datetime.date(2026, 3, 2),
+        )
+        self.assertEqual(res_match["finding"], "match")
+        self.assertIn("quote", res_match)
+
+        # 2. Unaligned camera speed discrepancy (35 mph vs claimed 70 mph)
+        cam_row_conflict = RecordRow(
+            file="camera_log.csv",
+            row=11,
+            raw_text="2026-03-02T21:14:30-05:00,CAM-07,35,45",
+            device="CAM-07",
+            timestamp=1772504070.0,
+            sigma_sec=2.0,
+            fields={"timestamp": "2026-03-02T21:14:30-05:00", "device": "CAM-07", "speed_mph": "35", "zone_mph": "45"},
+            text_content="2026-03-02T21:14:30-05:00,CAM-07,35,45",
+        )
+        claim_conflict = "Witness claims vehicle was speeding at 70 mph in a 45 zone near 21:14."
+        retriever_conflict = InvertedIndexBM25([cam_row_conflict])
+
+        res_conflict = evaluate_claim(
+            claim=claim_conflict,
+            all_records=[cam_row_conflict],
+            all_schema_fields=schema_fields,
+            retriever=retriever_conflict,
+            clock_alignments=unaligned_clock,
+            default_tz=tz_neg5,
+            incident_date=datetime.date(2026, 3, 2),
+        )
+        # Unaligned camera must refuse conflict and settle on not_settled
+        self.assertEqual(res_conflict["finding"], "not_settled")
+        self.assertNotIn("cite", res_conflict)
+        self.assertNotIn("quote", res_conflict)
+
+    def test_12_negation_polarity_check(self):
+        """Tests that negation polarity mismatch prevents false matches on shared keywords."""
+        rec_row = RecordRow(
+            file="officer_notes.csv",
+            row=5,
+            raw_text='N-5,Officer Lee,"Suspect exited the vehicle upon request."',
+            device="Officer Lee",
+            fields={"notes": "Suspect exited the vehicle upon request."},
+            text_content="Suspect exited the vehicle upon request.",
+        )
+        claim_negated = "Officer notes suspect did not exit the vehicle upon request."
+        retriever = InvertedIndexBM25([rec_row])
+        schema_fields = {"notes", "author"}
+
+        res_neg = evaluate_claim(
+            claim=claim_negated,
+            all_records=[rec_row],
+            all_schema_fields=schema_fields,
+            retriever=retriever,
+            clock_alignments={},
+        )
+        # Polarity mismatch: "did not" in claim vs affirmative in record -> not_settled
+        self.assertEqual(res_neg["finding"], "not_settled")
+        self.assertNotIn("cite", res_neg)
+
+        # Matching polarity -> match
+        claim_positive = "Officer notes suspect exited the vehicle upon request."
+        res_pos = evaluate_claim(
+            claim=claim_positive,
+            all_records=[rec_row],
+            all_schema_fields=schema_fields,
+            retriever=retriever,
+            clock_alignments={},
+        )
+        self.assertEqual(res_pos["finding"], "match")
+        self.assertIn("quote", res_pos)
+
+    def test_13_dynamic_incident_date_inference_epoch_json(self):
+        """Tests dynamic incident_date inference on an epoch-only JSON dataset from a non-2026 date."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # 2024-08-15 14:00:00 UTC = 1723730400 seconds
+            epoch_ms = 1723730400 * 1000
+            json_data = [
+                {
+                    "event_id": "EV-01",
+                    "timestamp": epoch_ms,
+                    "event_type": "traffic_stop",
+                    "details": "Vehicle stopped for inspection"
+                }
+            ]
+            json_path = os.path.join(temp_dir, "dispatch.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(json_data, f)
+
+            all_records, schema_fields, default_tz, incident_date = ingest_records(temp_dir)
+            self.assertEqual(len(all_records), 1)
+            self.assertIsNotNone(incident_date)
+            # Inferred date must be in August 2024, not fallback 2026-03-02
+            self.assertEqual(incident_date.year, 2024)
+            self.assertEqual(incident_date.month, 8)
+        finally:
+            shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":

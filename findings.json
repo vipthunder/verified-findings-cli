@@ -13,10 +13,10 @@
       "claim": "The driver pulled into the Harbor Gas lot and stopped around 21:16.",
       "finding": "match",
       "cite": {
-        "file": "bodycam_transcript.vtt",
-        "row": 3
+        "file": "notes_cp1252.csv",
+        "row": 4
       },
-      "quote": "[SYNTHETIC] Officer Lee: Pulling in at the lot, about 21:16."
+      "quote": "Stopped at lot ~21:16"
     },
     {
       "claim": "A 911 call reporting the incident was logged at 21:11.",

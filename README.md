@@ -13,7 +13,7 @@ An offline, deterministic, probabilistic verification engine designed to check i
   - *Priors:* Assigns observation noise $\sigma_{\text{sec}}$ ($1\text{s}$ for exact seconds/epochs, $30\text{s}$ for HH:MM, $40\text{s}$ for hedged phrasing like *about*, *roughly*, *~*).
 
 - **Gaussian KDE Clock Synchronization:** 
-  Identifies reference events from timezone-aware JSON logs and pairs cross-source anchors (911 calls, stops, dispatch). Evaluates offsets $\delta = t_{\text{device}} - t_{\text{ref}}$ with combined variance across a 1D Gaussian KDE over $[-3600\text{s}, +3600\text{s}]$ ($5\text{s}$ grid). Posterior confidence incorporates sample-size shrinkage: $\text{confidence} = \text{in\_band\_weight\_ratio} \times (1 - e^{-N/1.5})$. Devices with $\text{confidence} < 0.75$ remain unaligned ($\sigma_{\text{clock}} = \infty$), strictly forbidding time-based conflict assertions.
+  Identifies reference events from timezone-aware JSON logs and pairs cross-source anchors (911 calls, stops, dispatch). Evaluates offsets $\delta = t_{\text{device}} - t_{\text{ref}}$ with combined variance across a 1D Gaussian KDE over $[-3600\text{s}, +3600\text{s}]$ ($5\text{s}$ grid). Posterior confidence incorporates sample-size shrinkage: $\text{confidence} = \text{in\_band\_weight\_ratio} \times (1 - e^{-N/1.2})$. Devices with $\text{confidence} < 0.75$ remain unaligned ($\sigma_{\text{clock}} = \infty$), strictly forbidding time-based conflict assertions.
 
 - **BM25 Retrieval & Bayesian Hypothesis Testing:** 
   Maintains inverted-index posting lists ($O(R \cdot L)$ build, $O(P \log K)$ query via `heapq`, executing in $<0.5\text{s}$ on $50,000$ rows). Filters multi-row traffic logs by incident proximity and semantic event categories. Evaluates quantitative claims via quadrature error $\sigma_{\text{total}} = \sqrt{\sigma_{\text{claim}}^2 + \sigma_{\text{rec}}^2 + \sigma_{\text{clock}}^2}$ and Gaussian residual $z = |\text{diff}| / \sigma_{\text{total}}$:
@@ -29,7 +29,7 @@ An offline, deterministic, probabilistic verification engine designed to check i
 
 ## 2. Three Hardest Decisions
 
-1. **Shrinkage-Penalized Clock Alignment Cutoff (0.75):** Rejecting alignment on single anchors ($N=1$ yields max confidence $0.487$). A false conflict severely penalizes verification; requiring multiple concordant anchors prevents jittery officer notes or unsynchronized cameras from declaring unwarranted conflicts.
+1. **Shrinkage-Penalized Clock Alignment Cutoff (0.75):** Rejecting alignment on single anchors ($N=1$ yields max confidence $0.565$, while concordant $N=2$ reaches $0.811 \ge 0.75$). A false conflict severely penalizes verification; requiring multiple concordant anchors prevents jittery officer notes or unsynchronized cameras from declaring unwarranted conflicts.
 2. **Semantic Category Compatibility Gating:** Restricting temporal difference checks to compatible event types (e.g., 911 calls vs. CAD call logs). Without this, BM25 returns adjacent scene arrivals whose expected multi-minute separation falsely triggered high-$z$ conflicts.
 3. **Raw Slice Extraction via `raw_decode`:** Storing verbatim substrings from the source stream rather than re-serializing parsed dicts, ensuring byte-exact compliance with the deterministic substring gate across all JSON and CSV variations.
 
